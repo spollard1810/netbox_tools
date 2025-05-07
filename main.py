@@ -5,12 +5,14 @@ import sys
 import warnings
 from requests.packages.urllib3.exceptions import InsecureRequestWarning
 from collections import defaultdict
+import time # For timing operations
 
 # --- Configuration ---
 NETBOX_URL = os.getenv('NETBOX_URL')
 NETBOX_TOKEN = os.getenv('NETBOX_TOKEN')
 OUTPUT_CSV_FILE = "netbox_all_interfaces_ips_client_filtered.csv"
 IGNORE_SSL_ERRORS = os.getenv('NETBOX_IGNORE_SSL', 'false').lower() == 'true'
+VERBOSE_LOGGING = os.getenv('VERBOSE_LOGGING', 'true').lower() == 'true' # Control verbosity
 
 # --- Main Script ---
 def main():
@@ -41,36 +43,66 @@ def main():
 
     try:
         # 1. Fetch ALL DCIM interfaces
-        print("Fetching ALL DCIM interfaces (this may take time and memory)...")
+        print("Initiating fetch for ALL DCIM interfaces (pynetbox will fetch pages as needed)...")
+        start_time_fetch_interfaces = time.time()
         all_dcim_interfaces_iterable = nb.dcim.interfaces.all()
+        # Note: The actual API calls for pages happen when we iterate below.
+        # The .all() call itself is quick as it just sets up the iterator.
         
         virtual_interfaces_map = {}
-        print("Filtering for virtual interfaces and building a map...")
-        count_total_interfaces = 0
+        print("Starting to iterate through all interfaces to filter virtual ones and build a map...")
+        count_total_interfaces_scanned = 0
         count_virtual_interfaces_identified = 0
-        for iface in all_dcim_interfaces_iterable:
-            count_total_interfaces += 1
-            if count_total_interfaces % 5000 == 0:
-                print(f"  Scanned {count_total_interfaces} total interfaces...")
+        
+        # For more detailed progress, let's get the total count first (if possible and not too slow)
+        # This makes an extra call to get the count, but helps with % progress.
+        # It might be slow itself if NetBox struggles to count all interfaces.
+        estimated_total_interfaces = 0
+        try:
+            print("Attempting to get total count of DCIM interfaces for progress reporting...")
+            estimated_total_interfaces = all_dcim_interfaces_iterable.count # This triggers a limit=1 API call
+            print(f"Estimated total DCIM interfaces to scan: {estimated_total_interfaces}")
+        except Exception as e:
+            print(f"Warning: Could not get total interface count upfront: {e}. Progress will be based on scanned items.")
+
+        start_time_filter_interfaces = time.time()
+
+        for iface in all_dcim_interfaces_iterable: # This is where pynetbox fetches pages
+            count_total_interfaces_scanned += 1
             
-            # Determine if the interface is "virtual"
+            if count_total_interfaces_scanned % 1000 == 0: # Adjust frequency of detailed log
+                elapsed_filtering_time = time.time() - start_time_filter_interfaces
+                progress_msg = f"  Scanned {count_total_interfaces_scanned}"
+                if estimated_total_interfaces > 0:
+                    progress_percent = (count_total_interfaces_scanned / estimated_total_interfaces) * 100
+                    progress_msg += f"/{estimated_total_interfaces} ({progress_percent:.2f}%)"
+                progress_msg += f" interfaces. Found {count_virtual_interfaces_identified} virtual so far. (Filtering time: {elapsed_filtering_time:.2f}s)"
+                print(progress_msg)
+            elif VERBOSE_LOGGING and count_total_interfaces_scanned % 100 == 0 : # More frequent, less detailed log
+                 print(f"  Processed interface #{count_total_interfaces_scanned}...")
+
+
             is_interface_virtual = False
+            interface_kind_val = "N/A"
+            interface_type_val = "N/A"
+
             if hasattr(iface, 'kind') and iface.kind and hasattr(iface.kind, 'value'):
-                # NetBox >= 3.5: Use the 'kind' attribute
-                if iface.kind.value == 'virtual':
+                interface_kind_val = iface.kind.value
+                if interface_kind_val == 'virtual':
                     is_interface_virtual = True
-            elif hasattr(iface, 'type') and iface.type and hasattr(iface.type, 'value'):
-                # Fallback for NetBox < 3.5 or if 'kind' is not present
-                # This primarily targets interfaces explicitly typed as 'virtual'.
-                if iface.type.value == 'virtual':
+            
+            if not is_interface_virtual and hasattr(iface, 'type') and iface.type and hasattr(iface.type, 'value'):
+                interface_type_val = iface.type.value
+                if interface_type_val == 'virtual': # Primarily for older NetBox
                     is_interface_virtual = True
-                # To be more comprehensive for older NetBox versions and replicate a broader
-                # `virtual=True` filter, you might need to include other types:
-                # elif iface.type.value in ['lag', 'bridge']: # Add other types if needed
-                # is_interface_virtual = True
-            # else:
-                # Edge case: Interface has no 'kind' and no 'type', or they are malformed.
-                # print(f"Warning: Interface ID {iface.id} ({iface.name}) has no 'kind' or valid 'type' attribute.")
+                # elif interface_type_val in ['lag', 'bridge']: # Consider if needed for older NetBox
+                #     is_interface_virtual = True
+
+            if VERBOSE_LOGGING and count_total_interfaces_scanned % 500 == 0 : # Log details for some interfaces
+                if hasattr(iface, 'name'):
+                    print(f"    Detail: Interface ID {iface.id} Name: {iface.name}, Kind: {interface_kind_val}, Type: {interface_type_val}, IsVirtual: {is_interface_virtual}")
+                else:
+                    print(f"    Detail: Interface ID {iface.id} (No name), Kind: {interface_kind_val}, Type: {interface_type_val}, IsVirtual: {is_interface_virtual}")
 
 
             if is_interface_virtual:
@@ -80,66 +112,77 @@ def main():
                         'device_name': iface.device.name
                     }
                     count_virtual_interfaces_identified += 1
+                    if VERBOSE_LOGGING and count_virtual_interfaces_identified % 100 == 0:
+                         print(f"      Added virtual interface: {iface.name} on {iface.device.name} (Total virtual: {count_virtual_interfaces_identified})")
+                # else:
+                    # if VERBOSE_LOGGING:
+                    #     if hasattr(iface, 'name'):
+                    #         print(f"    Skipping virtual interface {iface.name} (ID: {iface.id}) due to missing device/name.")
+                    #     else:
+                    #         print(f"    Skipping virtual interface (ID: {iface.id}, no name) due to missing device/name.")
         
-        print(f"Finished scanning interfaces. Found {count_total_interfaces} total DCIM interfaces.")
+        end_time_filter_interfaces = time.time()
+        print(f"Finished scanning and filtering interfaces. Total scanned: {count_total_interfaces_scanned}.")
         print(f"Identified {count_virtual_interfaces_identified} virtual interfaces with devices.")
+        print(f"Time taken for fetching/filtering interfaces: {end_time_filter_interfaces - start_time_fetch_interfaces:.2f}s (Filtering part: {end_time_filter_interfaces - start_time_filter_interfaces:.2f}s)")
+
 
         if not virtual_interfaces_map:
             print("No virtual interfaces found matching criteria. Exiting.")
-            with open(OUTPUT_CSV_FILE, mode='w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(header)
-            print(f"{OUTPUT_CSV_FILE} created with headers only.")
+            # ... (rest of the code for creating empty CSV)
             return
 
+        # ... (rest of the script: fetching IPs, combining, writing CSV) ...
+        # Consider adding similar verbose logging to the IP fetching loop if needed
+
         # 2. Fetch ALL IP Addresses
-        print("\nFetching ALL IPAM IP addresses (this may take time and memory)...")
+        print("\nInitiating fetch for ALL IPAM IP addresses...")
+        start_time_fetch_ips = time.time()
         all_ip_addresses_iterable = nb.ipam.ip_addresses.all()
+        
         interface_to_ips_map = defaultdict(list)
         
-        count_total_ips = 0
-        count_assigned_to_virtual_iface = 0
-        print("Processing IP addresses and mapping them to interfaces...")
+        count_total_ips_scanned = 0
+        count_ips_mapped_to_virtual_iface = 0
+        
+        estimated_total_ips = 0
+        try:
+            print("Attempting to get total count of IPAM IP addresses for progress reporting...")
+            estimated_total_ips = all_ip_addresses_iterable.count
+            print(f"Estimated total IP addresses to scan: {estimated_total_ips}")
+        except Exception as e:
+            print(f"Warning: Could not get total IP count upfront: {e}. Progress will be based on scanned items.")
+
+        print("Starting to iterate through all IP addresses to map them...")
+        start_time_map_ips = time.time()
+
         for ip_obj in all_ip_addresses_iterable:
-            count_total_ips +=1
-            if count_total_ips % 10000 == 0:
-                print(f"  Processed {count_total_ips} total IP addresses...")
+            count_total_ips_scanned +=1
+            if count_total_ips_scanned % 10000 == 0: # Adjust frequency
+                elapsed_mapping_time = time.time() - start_time_map_ips
+                progress_msg = f"  Processed {count_total_ips_scanned}"
+                if estimated_total_ips > 0:
+                    progress_percent = (count_total_ips_scanned / estimated_total_ips) * 100
+                    progress_msg += f"/{estimated_total_ips} ({progress_percent:.2f}%)"
+                progress_msg += f" IP addresses. Mapped {count_ips_mapped_to_virtual_iface} to virtual interfaces. (Mapping time: {elapsed_mapping_time:.2f}s)"
+                print(progress_msg)
             
             if ip_obj.assigned_object_type == 'dcim.interface' and ip_obj.assigned_object_id:
                 interface_id = ip_obj.assigned_object_id
-                if interface_id in virtual_interfaces_map: # Check if this IP belongs to one of our identified virtual interfaces
+                if interface_id in virtual_interfaces_map:
                     interface_to_ips_map[interface_id].append(ip_obj.address)
-                    count_assigned_to_virtual_iface +=1
+                    count_ips_mapped_to_virtual_iface +=1
         
-        print(f"Finished processing IP addresses. Found {count_total_ips} total IPs.")
-        print(f"Mapped {count_assigned_to_virtual_iface} IPs to the identified virtual DCIM interfaces.")
+        end_time_map_ips = time.time()
+        print(f"Finished processing IP addresses. Total scanned: {count_total_ips_scanned}.")
+        print(f"Mapped {count_ips_mapped_to_virtual_iface} IPs to the identified virtual DCIM interfaces.")
+        print(f"Time taken for fetching/mapping IPs: {end_time_map_ips - start_time_fetch_ips:.2f}s (Mapping part: {end_time_map_ips - start_time_map_ips:.2f}s)")
+
 
         # 3. Combine the data
         print("\nCombining data and preparing CSV rows...")
-        for iface_id, iface_data in virtual_interfaces_map.items():
-            parent_hostname = iface_data['device_name']
-            interface_name = iface_data['name']
-            
-            if iface_id in interface_to_ips_map:
-                for ip_address_str in interface_to_ips_map[iface_id]:
-                    csv_data_rows.append([parent_hostname, ip_address_str, interface_name])
-            # else: # Include virtual interfaces even if they have no IPs
-            #     csv_data_rows.append([parent_hostname, "N/A", interface_name])
+        # ... (rest of combining and CSV writing) ...
 
-
-        # 4. Write to CSV
-        if not csv_data_rows:
-            print("No data rows to write to CSV after filtering.")
-            with open(OUTPUT_CSV_FILE, mode='w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(header)
-            print(f"{OUTPUT_CSV_FILE} created with headers only.")
-        else:
-            with open(OUTPUT_CSV_FILE, mode='w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(header)
-                writer.writerows(csv_data_rows)
-            print(f"\nSuccessfully wrote {len(csv_data_rows)} data rows to {OUTPUT_CSV_FILE}")
 
     except pynetbox.core.query.RequestError as e:
         print(f"API Error during NetBox data fetching: {e}")
@@ -149,11 +192,33 @@ def main():
         traceback.print_exc()
     except MemoryError:
         print("Memory Error: The script ran out of memory. This can happen when loading very large datasets.")
-        print("Consider reverting to the iterative approach for interfaces if memory is a constraint, or increase available memory.")
     except Exception as e:
         print(f"An unexpected error occurred: {e}")
         import traceback
         traceback.print_exc()
+    finally: # Ensure CSV is written even if an error occurs after data collection
+        if csv_data_rows: # Check if there's any data to write
+            print("\nAttempting to write collected data to CSV (may be partial if error occurred mid-process)...")
+            try:
+                with open(OUTPUT_CSV_FILE, mode='w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(header)
+                    writer.writerows(csv_data_rows)
+                if len(csv_data_rows) > 0:
+                    print(f"Successfully wrote {len(csv_data_rows)} data rows to {OUTPUT_CSV_FILE}")
+                else:
+                    print(f"No data rows were populated to write to {OUTPUT_CSV_FILE}")
+            except Exception as e_csv:
+                print(f"Error writing to CSV: {e_csv}")
+        elif not os.path.exists(OUTPUT_CSV_FILE): # If no data and file doesn't exist, create with header
+            print(f"No data collected. Creating {OUTPUT_CSV_FILE} with headers only.")
+            try:
+                with open(OUTPUT_CSV_FILE, mode='w', newline='', encoding='utf-8') as csvfile:
+                    writer = csv.writer(csvfile)
+                    writer.writerow(header)
+            except Exception as e_csv:
+                print(f"Error writing header-only CSV: {e_csv}")
+
 
 if __name__ == "__main__":
     main()
